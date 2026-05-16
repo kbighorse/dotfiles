@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# setup.sh — Recreate the Gas Town HQ at this path.
+#
+# Idempotent: safe to re-run. Skips steps already complete.
+# Assumes macOS with Homebrew. Assumes Cursor agent CLI already installed
+# (https://docs.cursor.com/cli).
+
+set -euo pipefail
+
+HQ="$HOME/code/lakeraven/rpms"
+BIN="$HOME/bin"
+RIGS=(
+    "baseroll      git@github.com:lakeraven/baseroll.git"
+    "corvid        https://github.com/lakeraven/corvid.git"
+    "lakeraven_ehr https://github.com/lakeraven/lakeraven-ehr.git"
+    "rpms_rpc      https://github.com/lakeraven/rpms-rpc.git"
+)
+
+say() { printf '\n==> %s\n' "$*"; }
+
+# ─────────────────────────────────────────────────────────────────────────
+# 1. Prerequisites
+# ─────────────────────────────────────────────────────────────────────────
+say "Checking prerequisites"
+command -v brew >/dev/null    || { echo "install Homebrew first: https://brew.sh"; exit 1; }
+command -v claude >/dev/null  || { echo "install Claude Code: https://claude.ai/code"; exit 1; }
+command -v cursor-agent >/dev/null || command -v agent >/dev/null \
+    || { echo "install Cursor agent CLI: https://docs.cursor.com/cli"; exit 1; }
+
+for pkg in gastown dolt beads tmux; do
+    brew list --formula "$pkg" &>/dev/null || brew install "$pkg"
+done
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2. PATH for ~/bin (wrappers live here)
+# ─────────────────────────────────────────────────────────────────────────
+say "Ensuring ~/bin on PATH"
+mkdir -p "$BIN"
+if ! grep -q 'HOME/bin:\$PATH' "$HOME/.zshrc" 2>/dev/null; then
+    printf '\n# gt-cursor wrappers live in ~/bin\nexport PATH="$HOME/bin:$PATH"\n' >> "$HOME/.zshrc"
+fi
+export PATH="$BIN:$PATH"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 3. Write the Cursor wrapper scripts
+# ─────────────────────────────────────────────────────────────────────────
+say "Installing gt-cursor + gt-cursor-batch to $BIN"
+
+cat > "$BIN/gt-cursor" <<'WRAPPER_EOF'
+#!/bin/bash
+# Cursor-agent wrapper for Gas Town polecat sessions. Loads the hooked bead
+# (or GT_CURSOR_BEAD override) and runs cursor-agent --print one-shot.
+set -e
+MODEL="${GT_CURSOR_MODEL:-gpt-5.3-codex-low}"
+CURSOR_BIN="${GT_CURSOR_BIN:-cursor-agent}"
+
+GT_CONTEXT=""
+command -v gt &>/dev/null && GT_CONTEXT=$(gt prime 2>/dev/null || true)
+
+BEAD_ID="${GT_CURSOR_BEAD:-}"
+if [[ -z "$BEAD_ID" ]] && HOOK_OUT=$(gt hook 2>/dev/null); then
+    BEAD_ID=$(printf '%s\n' "$HOOK_OUT" | grep -v "Nothing on hook" \
+        | grep -oE '\b(co|le|rr|ba|hq|gt)-[a-z0-9-]+' | head -1)
+fi
+
+PROMPT=""
+if [[ -n "$BEAD_ID" ]]; then
+    BEAD_BLOCK=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    b = d[0] if isinstance(d, list) and d else d
+    if isinstance(b, dict):
+        print(f\"Task ({b.get('id','')}): {b.get('title','')}\n\n{b.get('description','')}\")
+except Exception: pass
+" 2>/dev/null) || BEAD_BLOCK=""
+    [[ -n "$BEAD_BLOCK" ]] && PROMPT="${GT_CONTEXT:+$GT_CONTEXT
+
+---
+
+}$BEAD_BLOCK"
+fi
+
+if [[ -z "$PROMPT" ]]; then
+    [[ -n "${GT_CURSOR_DRY_RUN:-}" ]] && { echo "[dry-run] no bead; would run: $CURSOR_BIN -f --model $MODEL $*" >&2; exit 0; }
+    exec "$CURSOR_BIN" -f --model "$MODEL" "$@"
+fi
+
+if [[ -n "${GT_CURSOR_DRY_RUN:-}" ]]; then
+    echo "[dry-run] bead=$BEAD_ID model=$MODEL" >&2
+    echo "[dry-run] would run: $CURSOR_BIN -f --model $MODEL --print <prompt>" >&2
+    printf '%s\n' "$PROMPT" >&2
+    exit 0
+fi
+
+exec "$CURSOR_BIN" -f --model "$MODEL" --print "$PROMPT"
+WRAPPER_EOF
+
+cat > "$BIN/gt-cursor-batch" <<'BATCH_EOF'
+#!/bin/bash
+# Loop gt-cursor over one or more beads in a rig. Bypasses gt sling's
+# broken Cursor lifecycle. Captures each bead's output to a review file.
+#
+# Usage:
+#   gt-cursor-batch <rig> <bead-id> [<bead-id> ...]
+#   echo "co-7g9 co-NNN" | gt-cursor-batch <rig> -
+set -euo pipefail
+
+[[ $# -lt 2 ]] && { sed -n '4,7p' "$0" | sed 's/^# \?//'; exit 1; }
+
+RIG="$1"; shift
+GT_ROOT="${GT_ROOT:-$HOME/code/lakeraven/rpms}"
+WORKDIR="$GT_ROOT/$RIG/mayor/rig"
+BEADS_DIR="$GT_ROOT/$RIG/.beads"
+OUT_DIR="${GT_CURSOR_BATCH_DIR:-/tmp/gt-cursor-reviews}"
+
+[[ -d "$WORKDIR" ]]    || { echo "error: workdir $WORKDIR not found" >&2; exit 2; }
+[[ -d "$BEADS_DIR" ]]  || { echo "error: $BEADS_DIR not found" >&2; exit 2; }
+command -v gt-cursor >/dev/null || { echo "error: gt-cursor not in PATH" >&2; exit 2; }
+
+mkdir -p "$OUT_DIR"
+BEADS=()
+if [[ "$1" == "-" ]]; then
+    while read -r line; do for t in $line; do [[ -n "$t" ]] && BEADS+=("$t"); done; done
+else
+    BEADS=("$@")
+fi
+[[ ${#BEADS[@]} -eq 0 ]] && { echo "error: no beads" >&2; exit 2; }
+
+echo "==> Batch: rig=$RIG, ${#BEADS[@]} bead(s)" >&2
+ok=0; fail=0
+for bead in "${BEADS[@]}"; do
+    out="$OUT_DIR/${bead}.md"; err="$OUT_DIR/${bead}.err"
+    echo "" >&2; echo "--- $bead ---" >&2
+    if ! BEADS_DIR="$BEADS_DIR" bd show "$bead" --json &>/dev/null; then
+        echo "  skip: bead not found" >&2; ((fail++)) || true; continue
+    fi
+    start=$(date +%s)
+    if (cd "$WORKDIR" && BEADS_DIR="$BEADS_DIR" GT_CURSOR_BEAD="$bead" gt-cursor) > "$out" 2> "$err"; then
+        echo "  ok ($(( $(date +%s) - start ))s) → $out" >&2; ((ok++)) || true
+    else
+        rc=$?; echo "  FAIL exit=$rc → $err" >&2; ((fail++)) || true
+    fi
+done
+echo "" >&2
+echo "==> Done: $ok ok, $fail fail. Reviews in $OUT_DIR" >&2
+[[ $fail -gt 0 ]] && exit 3 || exit 0
+BATCH_EOF
+
+chmod +x "$BIN/gt-cursor" "$BIN/gt-cursor-batch"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 4. Create the HQ
+# ─────────────────────────────────────────────────────────────────────────
+say "Creating HQ at $HQ"
+mkdir -p "$HQ"
+cd "$HQ"
+if [[ ! -f mayor/town.json ]]; then
+    gt install . --no-beads 2>&1 | tail -5
+    gt install . 2>&1 | grep -E "✓|⚠" | head -10
+else
+    echo "  HQ already initialized"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# 5. Register the Cursor agent runtime
+# ─────────────────────────────────────────────────────────────────────────
+say "Registering 'agent' runtime → gt-cursor"
+gt config agent set agent "$BIN/gt-cursor" 2>&1 | tail -2
+
+# ─────────────────────────────────────────────────────────────────────────
+# 6. Add rigs (skip if already registered)
+# ─────────────────────────────────────────────────────────────────────────
+say "Registering rigs"
+REGISTERED=$(gt rig list 2>/dev/null | awk '/^[⚫●]/ {print $2}')
+for entry in "${RIGS[@]}"; do
+    name="${entry%% *}"
+    url="${entry##* }"
+    if grep -qx "$name" <<<"$REGISTERED"; then
+        echo "  $name already registered"
+    else
+        echo "  adding $name"
+        gt rig add "$name" "$url" 2>&1 | grep -E "✓|Error" | head -3
+    fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────
+# 7. Done
+# ─────────────────────────────────────────────────────────────────────────
+say "Setup complete"
+gt rig list
+echo ""
+echo "Next:"
+echo "  gt daemon start          # start the daemon (warning: spawns autonomous Claude fleet)"
+echo "  gt mayor attach          # interactive Mayor session"
+echo "  gt-cursor-batch <rig> <bead-id>   # standalone Cursor review (no fleet)"
