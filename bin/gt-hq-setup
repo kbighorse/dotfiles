@@ -51,7 +51,7 @@ cat > "$BIN/gt-cursor" <<'WRAPPER_EOF'
 # Cursor-agent wrapper for Gas Town polecat sessions. Loads the hooked bead
 # (or GT_CURSOR_BEAD override) and runs cursor-agent --print one-shot.
 set -e
-MODEL="${GT_CURSOR_MODEL:-gpt-5.3-codex-low}"
+MODEL="${GT_CURSOR_MODEL:-gpt-5.5-low}"
 CURSOR_BIN="${GT_CURSOR_BIN:-cursor-agent}"
 
 GT_CONTEXT=""
